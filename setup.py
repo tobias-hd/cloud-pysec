@@ -34,6 +34,7 @@ setup(
         'requests>=2.21.0',
         'six>=1.11.0',
         'pyjwt>=1.7.0',
+        'aiohttp>=3.6',
         '{}'.format(sap_py_jwt_dep)
     ],
     long_description=LONG_DESCRIPTION,

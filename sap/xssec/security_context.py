@@ -7,6 +7,7 @@ import logging
 import requests
 import deprecation
 import urllib3
+from aiohttp import BasicAuth
 
 from sap.xssec import constants
 from sap.xssec.jwt_validation_facade import JwtValidationFacade, DecodeError
@@ -28,6 +29,13 @@ def _check_config(config):
         if prop in config:
             item = config[prop]
         _check_if_valid(item, 'config.{0}'.format(prop))
+
+
+def _check_service_credentials(service_credentials):
+    for prop in ['clientid', 'clientsecret', 'url']:
+        if prop not in service_credentials:
+            raise ValueError(
+                '"{0}" not found in "service_credentials"'.format(prop))
 
 
 class SecurityContext(object):
@@ -489,13 +497,12 @@ class SecurityContext(object):
         """
         return self._properties['is_foreign_mode']
 
-    def _check_uaa_response(self, response, url, grant_type):
-        status_code = response.status_code
+    def _check_uaa_response(self, status_code, resp_text, url, grant_type):
         if status_code == 200:
             return
         self._logger.debug(
             'Call to %s was not successful, status code: %d, response %s',
-            url, status_code, response.text)
+            url, status_code, resp_text)
 
         if status_code == 401:
             raise RuntimeError(
@@ -508,8 +515,30 @@ class SecurityContext(object):
                 'Call to /oauth/token was not successful (grant_type: {0}).'.format(
                     grant_type) + ' HTTP status code: {0}'.format(status_code))
 
+    # def _check_uaa_response(self, response, url, grant_type):
+    #     status_code = response.status_code
+    #     if status_code == 200:
+    #         return
+    #     self._logger.debug(
+    #         'Call to %s was not successful, status code: %d, response %s',
+    #         url, status_code, response.text)
+
+    #     if status_code == 401:
+    #         raise RuntimeError(
+    #             'Call to /oauth/token was not successful (grant_type: {0}).'.format(
+    #                 grant_type) +
+    #             ' Authorization header invalid, requesting client does not have' +
+    #             ' grant_type={0} or no scopes were granted.'.format(constants.GRANTTYPE_JWT_BEARER))
+    #     else:
+    #         raise RuntimeError(
+    #             'Call to /oauth/token was not successful (grant_type: {0}).'.format(
+    #                 grant_type) + ' HTTP status code: {0}'.format(status_code))
+
+    def _format_token_url(self, service_credentials):
+        return '{}/oauth/token'.format(service_credentials['url'])
+
     def _get_user_token(self, service_credentials, scopes):
-        url = '{}/oauth/token'.format(service_credentials['url'])
+        url = self._format_token_url(service_credentials)
         response = requests.post(url, headers={
             'Accept': 'application/json',
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -521,8 +550,27 @@ class SecurityContext(object):
             'scope': scopes
         }, auth=(service_credentials['clientid'],  service_credentials['clientsecret']))
 
-        self._check_uaa_response(response, url, constants.GRANTTYPE_JWT_BEARER)
+        self._check_uaa_response(response.status_code, response.text, url, constants.GRANTTYPE_JWT_BEARER)
         return response.json()['access_token']
+
+    async def _get_user_token_async(self, service_credentials, session, scopes):
+        url = self._format_token_url(service_credentials)
+        self._logger.debug("Will request async %s", url)
+        async with session.post(url, headers={
+            'Accept': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }, data={
+            'grant_type': constants.GRANTTYPE_JWT_BEARER,
+            'response_type': 'token',
+            'client_id': service_credentials['clientid'],
+            'assertion': self._token,
+            'scope': scopes or ""
+        }, auth=BasicAuth(service_credentials['clientid'],  service_credentials['clientsecret'])) as response:
+            resp_json = await response.json()
+            resp_text = await response.text()
+
+        self._check_uaa_response(response.status, resp_text, url, constants.GRANTTYPE_JWT_BEARER)
+        return resp_json['access_token']
 
     def request_token_for_client(self, service_credentials, scopes=None):
         """
@@ -536,11 +584,26 @@ class SecurityContext(object):
         :return: Token.
         """
         _check_if_valid(service_credentials, 'service_credentials')
-        for prop in ['clientid', 'clientsecret', 'url']:
-            if prop not in service_credentials:
-                raise ValueError(
-                    '"{0}" not found in "service_credentials"'.format(prop))
+        _check_service_credentials(service_credentials)
         return self._get_user_token(service_credentials, scopes)
+
+    async def request_token_for_client_async(self, service_credentials, session, scopes=None):
+        """
+        :param service_credentials: The credentials of the service as dict.
+            The attributes clientid, clientsecret and url (UAA) are mandatory.
+
+        :param session: Instance of aiohttp.ClientSession, for fetching the 
+            token asynchronously
+
+        :param scopes: comma-separated list of requested scopes for the token,
+            e.g. app.scope1,app.scope2. If null, all scopes are granted.
+            Note that $XSAPPNAME is not supported as part of the scope names.
+
+        :return: Token.
+        """
+        _check_if_valid(service_credentials, 'service_credentials')
+        _check_service_credentials(service_credentials)
+        return await self._get_user_token_async(service_credentials, session, scopes)
 
     def has_attributes(self):
         """
